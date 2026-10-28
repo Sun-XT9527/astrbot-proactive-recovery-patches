@@ -1,0 +1,701 @@
+--- a/main.py
++++ b/main.py
+@@ -16,6 +16,7 @@
+ 
+ # 导入各模块的 Mixins，用于组装插件能力
+ from .core.chat_flow import ProactiveCoreMixin
++from .core.recovery import RecoveryMixin
+ from .core.data_storage import StorageMixin
+ from .core.llm_adapter import LlmMixin
+ from .core.message_events import EventsMixin
+@@ -32,6 +33,7 @@
+ 
+ 
+ class ProactiveChatPlugin(
++    RecoveryMixin,  # Durable scheduling and explicit-receipt rounds
+     SessionMixin,  # 会话 ID 解析、规范化与日志格式化
+     StorageMixin,  # 会话数据加载/保存与迁移清理
+     ConfigMixin,  # 配置读取与会话级配置路由
+@@ -235,7 +237,7 @@
+ 
+     async def terminate(self) -> None:
+         """插件终止入口：委托 LifecycleMixin 清理。"""
+-        await LifecycleMixin.terminate(self)
++        await RecoveryMixin.terminate(self)
+ 
+     @filter.on_astrbot_loaded()
+     async def on_astrbot_loaded(self) -> None:
+--- /dev/null
++++ b/core/recovery.py
+@@ -0,0 +1,500 @@
++"""Durable, single-owner proactive rounds. No network operation is used as a receipt."""
++from __future__ import annotations
++
++import asyncio
++import json
++import os
++import random
++import time
++import uuid
++from datetime import datetime
++from pathlib import Path
++from urllib.parse import urlparse
++
++from astrbot.api import logger
++
++
++STATES = {
++    "waiting": "等待触发", "recovery_wait": "恢复等待", "network_retry": "网络重试",
++    "schedule_pause": "日程暂停", "quiet_pause": "免打扰暂停", "cap_pause": "4 次暂停",
++    "running": "正在检查", "disabled": "已停用",
++}
++BACKOFF = (60, 120, 300, 900)
++
++
++def atomic_snapshot(path: Path, data: dict) -> None:
++    """Commit the newest snapshot to both files; either valid newest copy can recover."""
++    path = Path(path)
++    path.parent.mkdir(parents=True, exist_ok=True)
++    blob = json.dumps(data, ensure_ascii=False, indent=2).encode("utf-8")
++    for destination in (path.with_suffix(path.suffix + ".bak"), path):
++        temporary = destination.with_suffix(destination.suffix + ".tmp")
++        with temporary.open("wb") as stream:
++            stream.write(blob)
++            stream.flush()
++            os.fsync(stream.fileno())
++        os.replace(temporary, destination)
++
++
++def load_snapshot(path: Path) -> dict:
++    candidates, existed = [], False
++    for source in (Path(path), Path(str(path) + ".bak")):
++        if not source.exists():
++            continue
++        existed = True
++        try:
++            data = json.loads(source.read_text(encoding="utf-8"))
++            if not isinstance(data, dict) or any(not isinstance(v, dict) for v in data.values()):
++                raise ValueError("Invalid session snapshot")
++            candidates.append(data)
++        except (ValueError, OSError):
++            logger.error(f"[主动恢复] 状态副本不可读: {source.name}")
++    if not candidates and existed:
++        # Fail closed, rather than silently losing the four-round stop.
++        raise RuntimeError("主动消息状态及备份均不可读，暂停启动，禁止清零计数")
++    return max(candidates, key=lambda d: max((v.get("storage_revision", 0) for v in d.values()), default=0), default={})
++
++
++class RecoveryMixin:
++    RECOVERY_VERSION = "2026.10.28-r1"
++
++    async def initialize(self):
++        self._round_locks = {}
++        self._active_rounds = {}
++        self._recovery_task = None
++        self._last_watch = time.time()
++        self._last_probe = 0.0
++        self._network_ok = {}
++        self._storage_dirty = False
++        await super().initialize()
++        self._recovery_task = asyncio.create_task(self._recovery_loop())
++        logger.info(f"[主动恢复] {self.RECOVERY_VERSION} 已加载；30 秒巡检，60 秒连接检测")
++
++    async def terminate(self):
++        self._terminating = True
++        task = getattr(self, "_recovery_task", None)
++        if task:
++            task.cancel()
++            await asyncio.gather(task, return_exceptions=True)
++        # The scheduler cancellation below stops in-flight rounds. Their durable markers
++        # remain until startup, so an ambiguous send is never replayed.
++        await super().terminate()
++
++    async def _load_data_internal(self):
++        self.session_data = load_snapshot(Path(self.session_data_file))
++
++    async def _save_data_internal(self):
++        revision = max((v.get("storage_revision", 0) for v in self.session_data.values()), default=0) + 1
++        for state in self.session_data.values():
++            state["storage_revision"] = revision
++        try:
++            # Small local state: deliberately no yield between first ACK and durable count.
++            atomic_snapshot(Path(self.session_data_file), self.session_data)
++            self._storage_dirty = False
++        except OSError:
++            self._storage_dirty = True
++            raise
++
++    def _merge_session_info(self, base, incoming):
++        # Newer reply epochs/generations own their counter, including a genuine reset.
++        if "generation" in base or "generation" in incoming:
++            key = lambda d: (d.get("reply_epoch", 0), d.get("generation", 0), d.get("storage_revision", 0))
++            older, newer = sorted((base, incoming), key=key)
++            return {**older, **newer}
++        return super()._merge_session_info(base, incoming)
++
++    def _managed_sessions(self):
++        sessions = set(self.session_data)
++        sessions.update(self.session_override_manager.list_sessions())
++        for scope in ("friend_settings", "group_settings"):
++            settings = self.config.get(scope, {})
++            if settings.get("enable"):
++                for sid in settings.get("session_list", []):
++                    cfg = self._get_session_config(sid)
++                    if cfg:
++                        sessions.add(self._resolve_session_id_for_config(sid, cfg))
++        return sorted({self._normalize_session_id(s) for s in sessions
++                       if (self._get_session_config(s) or {}).get("enable")})
++
++    def _state(self, sid):
++        return self.session_data.setdefault(sid, {})
++
++    def _capped(self, sid):
++        cfg = self._get_session_config(sid) or {}
++        limit = int(cfg.get("schedule_settings", {}).get("max_unanswered_times", 4))
++        return limit > 0 and self._state(sid).get("unanswered_count", 0) >= limit
++
++    def _current(self, sid, token):
++        return not self._terminating and self._state(sid).get("generation", 0) == token
++
++    def _register(self, sid):
++        state = self._state(sid)
++        self._purge_related_jobs(sid)
++        due = state.get("next_trigger_time")
++        if due and not self._terminating:
++            self.scheduler.add_job(
++                self.check_and_chat, "date", run_date=datetime.fromtimestamp(due, self.timezone),
++                args=[sid, state.get("generation", 0)], id=sid, replace_existing=True,
++                misfire_grace_time=None, coalesce=True, max_instances=1,
++            )
++
++    def _add_chat_job(self, run_session_id, run_date):
++        # Legacy admin and group callers still use this interface. Capture a fresh token.
++        sid = self._normalize_session_id(run_session_id)
++        state = self._state(sid)
++        state["generation"] = state.get("generation", 0) + 1
++        state["next_trigger_time"] = run_date.timestamp()
++        self._register(sid)
++
++    async def _plan(self, sid, delay, status="waiting", reason="normal", token=None):
++        async with self.data_lock:
++            if token is not None and not self._current(sid, token):
++                return
++            if self._terminating:
++                return
++            state = self._state(sid)
++            state["generation"] = state.get("generation", 0) + 1
++            state.update(status=status, recovery_reason=reason, last_scheduled_at=time.time())
++            state["recovery_pending"] = status == "recovery_wait"
++            state["next_trigger_time"] = time.time() + delay if delay is not None else None
++            state["last_schedule_random_interval_seconds"] = delay
++            await self._save_data_internal()
++            self._register(sid)
++
++    async def _pause_cap(self, sid, token=None):
++        if self._state(sid).get("status") == "cap_pause" and not self._state(sid).get("next_trigger_time"):
++            self._purge_related_jobs(sid)
++            return
++        await self._plan(sid, None, "cap_pause", "unanswered_limit", token)
++
++    async def _recover(self, sid, reason, token=None):
++        if token is not None and not self._current(sid, token):
++            return
++        if self._capped(sid):
++            await self._pause_cap(sid, token)
++            return
++        state = self._state(sid)
++        # One durable deadline per unfinished episode, including overdue recovery waits.
++        if state.get("recovery_pending"):
++            if (state.get("next_trigger_time") or 0) > time.time():
++                self._register(sid)
++                return
++            # A previous recovery itself elapsed while the process was stopped/asleep.
++            # Start one new episode, then reuse it on repeated startup/wake notifications.
++            state["recovery_pending"] = False
++        state["recovery_pending"] = True
++        state["recovery_episode"] = uuid.uuid4().hex
++        delay = random.randint(300, 900)
++        state["recovery_delay_seconds"] = delay
++        await self._plan(sid, delay, "recovery_wait", reason, token)
++        logger.info(f"[主动恢复] {reason}：唯一恢复任务已注册，等待 {delay} 秒")
++
++    async def _init_jobs_from_data(self):
++        for sid in self._managed_sessions():
++            state = self._state(sid)
++            if self._capped(sid):
++                await self._pause_cap(sid)
++                continue
++            if state.get("inflight"):
++                # A process may stop after QQ accepted a message but before its ACK.
++                # Do not retry that payload; count only ACKs already committed.
++                if not state["inflight"].get("counted"):
++                    state["last_receipt"] = {"status": "unknown", "reason": "process_interrupted", "at": time.time(), "message_ids": []}
++                state["last_round"] = state.pop("inflight")
++            await self._recover(sid, "startup")
++        logger.info(f"[主动恢复] 启动恢复完成：{len(self.scheduler.get_jobs())} 个唯一任务")
++
++    async def _setup_auto_triggers_for_enabled_sessions(self):
++        # The watchdog owns recovery now; no parallel 30-minute bootstrap timer.
++        return
++
++    async def _schedule_next_chat_and_save(self, session_id, reset_counter=False):
++        sid = self._normalize_session_id(session_id)
++        cfg = self._get_session_config(sid) or {}
++        if not cfg.get("enable"):
++            return
++        state = self._state(sid)
++        if reset_counter:
++            state["unanswered_count"] = 0
++            state["reply_epoch"] = state.get("reply_epoch", 0) + 1
++            state["recovery_pending"] = False
++            state["retry_attempt"] = 0
++            # Invalidate a running round before yielding to any I/O.
++            state["generation"] = state.get("generation", 0) + 1
++        if self._capped(sid):
++            await self._pause_cap(sid)
++            return
++        schedule = cfg.get("schedule_settings", {})
++        lower = int(schedule.get("min_interval_minutes", 25)) * 60
++        upper = max(lower, int(schedule.get("max_interval_minutes", 120)) * 60)
++        state.update(last_schedule_min_interval_seconds=lower, last_schedule_max_interval_seconds=upper, recovery_pending=False)
++        await self._plan(sid, random.randint(lower, upper), reason="user_reply" if reset_counter else "normal")
++
++    async def _retry(self, sid, reason, token):
++        if not self._current(sid, token):
++            return
++        if self._capped(sid):
++            await self._pause_cap(sid, token)
++            return
++        state = self._state(sid)
++        attempt = state.get("retry_attempt", 0)
++        state["retry_attempt"] = attempt + 1
++        state["recovery_pending"] = False
++        await self._plan(sid, BACKOFF[min(attempt, 3)], "network_retry", reason, token)
++
++    async def _probe_session(self, sid):
++        """TCP reachability only. API availability/authentication still requires a receipt."""
++        from .proactive_event import resolve_platform_instance
++        platform = resolve_platform_instance(self.context.platform_manager, sid.split(":", 1)[0])
++        if platform is None:
++            return False
++        endpoints = set()
++        # QQ SDK's configured API origin; do not probe arbitrary public sites.
++        client = platform.get_client()
++        api = getattr(client, "api", None)
++        http = getattr(api, "_http", None)
++        for obj in (platform, api, http):
++            for key in ("base_url", "_base_url", "api_base", "base"):
++                value = getattr(obj, key, None)
++                if isinstance(value, str) and value.startswith(("http://", "https://")):
++                    endpoints.add(value)
++        if platform.meta().name == "qq_official" and not endpoints:
++            # The SDK selects these actual QQ API origins from its sandbox flag.
++            endpoints.add("https://sandbox.api.sgroup.qq.com" if getattr(client, "is_sandbox", False) else "https://api.sgroup.qq.com")
++        provider = await self._resolve_chat_provider(sid)
++        if provider is None:
++            return False
++        config = getattr(provider, "provider_config", {}) or {}
++        for key in ("api_base", "base_url", "api_base_url"):
++            value = config.get(key) or getattr(provider, key, None)
++            if isinstance(value, str) and value.startswith(("http://", "https://")):
++                endpoints.add(value)
++        if len(endpoints) < 2:
++            # Unknown endpoint configuration must not block custom providers forever.
++            logger.debug("[主动恢复] 仅检测可解析的已配置服务地址")
++        async def connect(url):
++            target = urlparse(url)
++            writer = None
++            try:
++                _, writer = await asyncio.wait_for(asyncio.open_connection(target.hostname, target.port or (443 if target.scheme == "https" else 80)), 3)
++                return True
++            except (OSError, asyncio.TimeoutError):
++                return False
++            finally:
++                if writer:
++                    writer.close()
++                    await asyncio.wait_for(writer.wait_closed(), 1)
++        results = await asyncio.gather(*(connect(e) for e in endpoints))
++        return bool(results) and all(results)
++
++    async def _watch_once(self, now=None, probe=True):
++        now = time.time() if now is None else now
++        woke = now - self._last_watch > 90
++        self._last_watch = now
++        if self._storage_dirty:
++            async with self.data_lock:
++                await self._save_data_internal()
++        for sid in self._managed_sessions():
++            if self._capped(sid):
++                await self._pause_cap(sid)
++                continue
++            if sid in self._active_rounds:
++                continue
++            if woke:
++                await self._recover(sid, "wake_or_loop_pause")
++            state = self._state(sid)
++            job = self.scheduler.get_job(sid)
++            if job and (len(job.args) < 2 or job.args[1] != state.get("generation", 0)):
++                if (state.get("next_trigger_time") or 0) > now:
++                    self._register(sid)
++                else:
++                    await self._recover(sid, "stale_task")
++            elif not job:
++                if state.get("recovery_pending"):
++                    self._register(sid)
++                else:
++                    await self._recover(sid, "missing_task")
++        if probe and now - self._last_probe >= 60:
++            self._last_probe = now
++            for sid in self._managed_sessions():
++                try:
++                    reachable = await self._probe_session(sid)
++                except Exception:
++                    reachable = False
++                previous = self._network_ok.get(sid)
++                self._network_ok[sid] = reachable
++                if reachable and previous is False and sid not in self._active_rounds:
++                    await self._recover(sid, "network_restored")
++
++    async def _recovery_loop(self):
++        while not self._terminating:
++            try:
++                if not self._startup_finalized and self._are_platforms_available():
++                    await self._finalize_startup()
++                if self._startup_finalized:
++                    await self._watch_once()
++            except asyncio.CancelledError:
++                raise
++            except Exception as exc:
++                logger.error(f"[主动恢复] 巡检失败，将于 30 秒后重试: {type(exc).__name__}")
++            await asyncio.sleep(30)
++
++    async def _accept_receipt(self, sid, token, round_id, receipt):
++        """The ONLY counter write on a successful delivery, shared by segments/hooks."""
++        async with self.data_lock:
++            state = self._state(sid)
++            state["last_receipt"] = {**receipt, "round_id": round_id, "at": time.time()}
++            inflight = state.get("inflight", {})
++            if inflight.get("id") == round_id:
++                inflight.setdefault("receipts", []).append(state["last_receipt"])
++                if receipt.get("status") == "confirmed" and receipt.get("message_ids") and not inflight.get("counted"):
++                    inflight["counted"] = True
++                    if self._current(sid, token):
++                        state["unanswered_count"] = state.get("unanswered_count", 0) + 1
++                        if self._capped(sid):
++                            state["status"] = "cap_pause"
++                            state["next_trigger_time"] = None
++            await self._save_data_internal()
++
++    async def _send_chain(self, session_id, event, components):
++        # No fallback replay after an exception or an unknown send outcome.
++        if not components or event is None or not hasattr(event, "_recovery_token"):
++            return False
++        from astrbot.core.message.message_event_result import MessageChain
++        return await event.send(MessageChain(list(components)))
++
++    async def check_and_chat(self, session_id, generation=None):
++        sid = self._normalize_session_id(session_id)
++        state = self._state(sid)
++        token = state.get("generation", 0) if generation is None else generation
++        lock = self._round_locks.setdefault(sid, asyncio.Lock())
++        if lock.locked() or not self._current(sid, token):
++            return
++        async with lock:
++            if not self._current(sid, token):
++                return
++            # An overdue callback may beat the watchdog after resume.
++            due = state.get("next_trigger_time", time.time()) or time.time()
++            if time.time() - self._last_watch > 90 or (time.time() - due > 60 and not state.get("recovery_pending")):
++                await self._recover(sid, "overdue_callback", token)
++                return
++            if self._capped(sid):
++                await self._pause_cap(sid, token)
++                return
++            self._active_rounds[sid] = token
++            event = None
++            try:
++                allowed, reason = await self._is_chat_allowed(sid)
++                if not allowed:
++                    await self._plan(sid, self._normal_delay(sid), "quiet_pause" if reason == "quiet_hours" else "disabled", reason, token)
++                    return
++                # Refresh connectivity before content generation, without model calls.
++                reachable = await self._probe_session(sid)
++                self._network_ok[sid] = reachable
++                if not reachable:
++                    await self._retry(sid, "endpoint_unreachable", token)
++                    return
++                if not self._current(sid, token):
++                    return
++                state.update(recovery_pending=False, status="running")
++                round_id = uuid.uuid4().hex
++                state["inflight"] = {"id": round_id, "generation": token, "counted": False, "phase": "generating", "started_at": time.time()}
++                async with self.data_lock:
++                    await self._save_data_internal()
++                package = await self._prepare_llm_request(sid)
++                if not package:
++                    await self._retry(sid, "context_unavailable", token)
++                    return
++                event = self._build_proactive_event(sid)
++                if event is None:
++                    await self._retry(sid, "event_unavailable", token)
++                    return
++                event._recovery_token = token
++                event._recovery_round_id = round_id
++                response, prompt = await asyncio.wait_for(self._generate_llm_response(
++                    sid, self._get_session_config(sid), package["history"], package["system_prompt"],
++                    state.get("unanswered_count", 0), event=event,
++                    conversation=package.get("conversation"), platform_context=package.get("platform_context", ""),
++                ), 300)
++                if not self._current(sid, token):
++                    return
++                if not response:
++                    guard = event.get_extra("schedule_guard.check") or {}
++                    if (guard.get("record") or {}).get("status") == "busy":
++                        await self._plan(sid, self._normal_delay(sid), "schedule_pause", "schedule_busy", token)
++                    elif event.is_stopped():
++                        await self._plan(sid, self._normal_delay(sid), "schedule_pause", "hook_stopped", token)
++                    else:
++                        await self._retry(sid, "model_failure", token)
++                    return
++                text = self._extract_response_text(response)
++                chain = self._extract_response_chain(response)
++                if not text and not chain:
++                    await self._retry(sid, "empty_model_response", token)
++                    return
++                await asyncio.wait_for(self._send_proactive_message(sid, text, event=event, initial_chain=chain), 180)
++                # Confirmation is authoritative even when the final segment/hook failed.
++                counted = state.get("inflight", {}).get("counted", False)
++                unknown = getattr(event, "proactive_outcome_unknown", False)
++                if not self._current(sid, token):
++                    return
++                if counted:
++                    state["retry_attempt"] = 0
++                    await self._finish_normal(sid, token)
++                    # Save only confirmed text; partial deliveries never claim the full text.
++                    confirmed_text = "".join(getattr(event, "proactive_confirmed_text", []))
++                    if confirmed_text:
++                        await self._archive_confirmed(sid, package["conv_id"], prompt, confirmed_text)
++                elif unknown:
++                    await self._finish_normal(sid, token)
++                elif event.is_stopped():
++                    await self._plan(sid, self._normal_delay(sid), "schedule_pause", "hook_stopped", token)
++                else:
++                    await self._retry(sid, "send_failed", token)
++            except asyncio.CancelledError:
++                raise
++            except Exception as exc:
++                logger.error(f"[主动恢复] 本轮异常: {type(exc).__name__}，保留回执与调度状态")
++                if self._current(sid, token):
++                    if state.get("inflight", {}).get("counted") or getattr(event, "proactive_outcome_unknown", False):
++                        await self._finish_normal(sid, token)
++                    else:
++                        await self._retry(sid, "round_exception", token)
++            finally:
++                self._active_rounds.pop(sid, None)
++                inflight = state.get("inflight")
++                if inflight and inflight.get("generation") == token:
++                    state["last_round"] = state.pop("inflight")
++                    async with self.data_lock:
++                        await self._save_data_internal()
++                await self._clear_manual_trigger_state(sid)
++
++    def _normal_delay(self, sid):
++        schedule = (self._get_session_config(sid) or {}).get("schedule_settings", {})
++        lower = int(schedule.get("min_interval_minutes", 25)) * 60
++        return random.randint(lower, max(lower, int(schedule.get("max_interval_minutes", 120)) * 60))
++
++    async def _finish_normal(self, sid, token):
++        if self._capped(sid):
++            await self._pause_cap(sid, token)
++        else:
++            await self._plan(sid, self._normal_delay(sid), token=token)
++
++    async def _archive_confirmed(self, sid, conv_id, prompt, text):
++        from astrbot.core.agent.message import AssistantMessageSegment, TextPart, UserMessageSegment
++        try:
++            await self.context.conversation_manager.add_message_pair(
++                cid=conv_id, user_message=UserMessageSegment(content=[TextPart(text=prompt)]),
++                assistant_message=AssistantMessageSegment(content=[TextPart(text=text)]),
++            )
++        except Exception as exc:
++            logger.error(f"[主动恢复] 已确认发送的消息存档失败，不重发: {type(exc).__name__}")
++
++    def recovery_status(self):
++        return [{"session": sid, "state": self._state(sid).get("status", "waiting"),
++                 "label": STATES.get(self._state(sid).get("status"), "等待触发"),
++                 "unanswered_count": self._state(sid).get("unanswered_count", 0),
++                 "next_trigger_time": self._state(sid).get("next_trigger_time"),
++                 "reason": self._state(sid).get("recovery_reason"),
++                 "last_receipt": self._state(sid).get("last_receipt"),
++                 "generation": self._state(sid).get("generation", 0)} for sid in self._managed_sessions()]
+--- a/core/proactive_event.py
++++ b/core/proactive_event.py
+@@ -362,57 +362,56 @@
+     # ------------------------------------------------------------------
+     # 发送能力
+     # ------------------------------------------------------------------
+-    async def send(self, message: MessageChain) -> bool:  # type: ignore[override]
+-        """发送消息到目标平台。
+-
+-        显式委托给平台实例，并在平台不可用时回退到核心发送 API。
+-        发送成功后同步补写平台消息流水，保证钩子在装饰/发送后阶段
+-        用 event.send(...) 补发的内容同样可被后续上下文读取。
+-
+-        Returns:
+-            True 表示消息已成功送达；False 表示平台与核心 API 均未能送达。
+-        """
+-        if message is None:
+-            return False
+-
++    async def send(self, message: MessageChain) -> bool:
++        """Send once, recording a durable round ACK before any history/hook I/O."""
+         plugin = self._proactive_plugin
+-        if plugin is None:
+-            return False
+-
++        token = getattr(self, "_recovery_token", None)
++        if message is None or plugin is None or token is None:
++            return False
++        sid = self._proactive_umo
++        if not plugin._current(sid, token) or getattr(self, "proactive_outcome_unknown", False):
++            return False
++        platform = self._resolve_platform()
++        receipt = {"status": "failed", "message_ids": [], "reason": "platform_unavailable"}
++        callback_seen = False
++        async def acknowledged(result):
++            nonlocal callback_seen
++            callback_seen = True
++            await plugin._accept_receipt(sid, token, self._recovery_round_id, result)
++        if platform is not None and platform.status == PlatformStatus.RUNNING:
++            session = MessageSession(platform_name=platform.meta().id,
++                message_type=MessageType.GROUP_MESSAGE if self._proactive_is_group else MessageType.FRIEND_MESSAGE,
++                session_id=self._proactive_target_id)
++            state = plugin._state(sid)
++            state["inflight"]["phase"] = "sending"
++            async with plugin.data_lock:
++                await plugin._save_data_internal()
++            try:
++                send = getattr(platform, "send_by_session_with_receipt", None)
++                if send is None:
++                    # Unsupported platforms cannot turn a void-return send into a confirmed ACK.
++                    await platform.send_by_session(session, message)
++                    receipt = {"status": "unknown", "message_ids": [], "reason": "receipt_api_unavailable"}
++                else:
++                    import asyncio
++                    receipt = await asyncio.wait_for(send(session, message, on_receipt=acknowledged), 45)
++            except Exception as exc:
++                receipt = {"status": "unknown", "message_ids": [], "reason": type(exc).__name__}
++        await acknowledged(receipt)
++        self.proactive_receipts = getattr(self, "proactive_receipts", []) + [receipt]
++        unknown_segment = any(s.get("status") == "unknown" for s in receipt.get("segments", []))
++        if receipt.get("status") == "unknown" or unknown_segment:
++            self.proactive_outcome_unknown = True
++        confirmed = receipt.get("status") == "confirmed" and bool(receipt.get("message_ids"))
++        if not confirmed:
++            self.proactive_send_failed = True
++            return False
++        self._has_send_oper = True
+         self.proactive_sent_chains.append(message)
+-
+-        sent = False
+-        platform = self._resolve_platform()
+-        if platform is not None and platform.status == PlatformStatus.RUNNING:
+-            if MessageSession is None:  # pragma: no cover - 极旧版本
+-                sent = await self._send_via_core_api(message)
+-            else:
+-                try:
+-                    session_obj = MessageSession(
+-                        platform_name=platform.meta().id,
+-                        message_type=(
+-                            MessageType.GROUP_MESSAGE
+-                            if self._proactive_is_group
+-                            else MessageType.FRIEND_MESSAGE
+-                        ),
+-                        session_id=self._proactive_target_id,
+-                    )
+-                    await platform.send_by_session(session_obj, message)
+-                    sent = True
+-                except Exception as e:
+-                    logger.error(f"[主动消息] 平台发送失败喵，尝试核心 API 兜底: {e}")
+-
+-        if not sent:
+-            sent = await self._send_via_core_api(message)
+-
+-        if not sent:
+-            # 标记失败，调用方据此跳过流水、存档与成功计数。
+-            self.proactive_send_failed = True
+-            logger.error("[主动消息] 事件发送失败喵：平台与核心 API 均未能送达。")
+-            return False
+-
+-        # 与官方语义对齐：仅在真正送达后才置位，避免依赖该标志的插件误判。
+-        self._has_send_oper = True
++        # A partially accepted multi-media chain is not a full-text history record.
++        if not receipt.get("partial"):
++            self.proactive_confirmed_text = getattr(self, "proactive_confirmed_text", []) + [
++                "".join(getattr(c, "text", "") or "" for c in message.chain)]
+         await self._persist_sent_chain(message)
+         return True
+ 
+--- a/core/message_events.py
++++ b/core/message_events.py
+@@ -21,6 +21,13 @@
+ 
+     async def on_friend_message(self, event: AstrMessageEvent):
+         """监听私聊消息，取消旧任务，并重置计时器和计数器。"""
++        # Only genuine inbound human messages can reset the durable four-round stop.
++        if getattr(event, "_proactive_plugin", None) is not None:
++            return
++        if str(getattr(getattr(event, "message_obj", None), "message_id", "")).startswith("proactive:"):
++            return
++        if event.get_sender_id() and str(event.get_sender_id()) == str(event.get_self_id()):
++            return
+         # 没有消息内容则无需处理
+         if not event.get_messages():
+             return
+@@ -34,6 +41,11 @@
+         self.last_message_times[normalized_session_id] = current_time
+ 
+         async with self.data_lock:
++            state = self.session_data.setdefault(normalized_session_id, {})
++            state["generation"] = state.get("generation", 0) + 1
++            state["reply_epoch"] = state.get("reply_epoch", 0) + 1
++            state["unanswered_count"] = 0
++            state["recovery_pending"] = False
+             # 先迁移旧键：raw 键中的历史 self_id 必须先并入规范化键，
+             # 否则会在写入当前 self_id 之后被 update 覆盖为旧值，
+             # 也会导致群聊侧在迁移前读不到 self_id 而误判 Bot 自身消息。
+--- a/core/web_admin_server.py
++++ b/core/web_admin_server.py
+@@ -972,6 +972,8 @@
+ 
+         return {
+             "running": True,
++            "recovery_sessions": self.plugin.recovery_status(),
++            "recovery_version": self.plugin.RECOVERY_VERSION,
+             # 版本来源按优先级依次回退，保证控制台总能显示一个可读值。
+             "version": getattr(self.plugin, "version", None)
+             or getattr(self.plugin, "__version__", None)
+--- a/admin/js/views/StatusView.jsx
++++ b/admin/js/views/StatusView.jsx
+@@ -371,6 +371,21 @@
+     return (
+         <Box>
+             <div className="dashboard-grid proactive-status-grid">
++                <div className="span-12">
++                    <div className="card status-panel-card">
++                        <Typography variant="h6">主动消息恢复状态</Typography>
++                        <Typography variant="body2">恢复等待 5–15 分钟 · 正常间隔沿用配置 · 确认发送 4 轮后等待你的回复</Typography>
++                        {(status.recovery_sessions || []).map((item) => (
++                            <Box key={item.session} sx={{ mt: 2, p: 2, border: '1px solid #555', borderRadius: 2 }}>
++                                <Typography variant="h6">{item.label} · 未回复 {item.unanswered_count} / 4</Typography>
++                                <Typography variant="body2">下次检查：{item.next_trigger_time ? new Date(item.next_trigger_time * 1000).toLocaleString('zh-CN', { timeZone: displayTimezone }) : '等待真实用户回复'}</Typography>
++                                <Typography variant="body2">原因：{item.reason || '正常等待'}</Typography>
++                                <Typography variant="body2">最近发送确认：{item.last_receipt ? (item.last_receipt.partial ? '部分已确认接收，其余不重放' : ({ confirmed: 'QQ 已确认接收', failed: '明确失败', unknown: '结果不明，不重放' }[item.last_receipt.status] || item.last_receipt.status)) : '尚无新回执'}</Typography>
++                                {item.last_receipt && <Typography variant="caption">{new Date(item.last_receipt.at * 1000).toLocaleString('zh-CN', { timeZone: displayTimezone })} · 消息 ID：{(item.last_receipt.message_ids || []).join(', ') || '无'}</Typography>}
++                            </Box>
++                        ))}
++                    </div>
++                </div>
+                 <div className="span-4">
+                     <div className="card status-panel-card status-panel-card-primary">
+                         <Box sx={{ display: 'flex', alignItems: 'center', gap: 1.5, mb: 3 }}>

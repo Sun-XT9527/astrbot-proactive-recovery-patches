@@ -1,0 +1,63 @@
+--- a/astrbot/core/platform/sources/qqofficial/qqofficial_platform_adapter.py
++++ b/astrbot/core/platform/sources/qqofficial/qqofficial_platform_adapter.py
+@@ -332,10 +332,35 @@
+     ) -> None:
+         await self._send_by_session_common(session, message_chain)
+ 
++    async def send_by_session_with_receipt(self, session, message_chain, on_receipt=None) -> dict:
++        """Explicit QQ acceptance receipts; the existing send_by_session API is unchanged.
++
++        A returned message ID confirms QQ API acceptance, not that the human has read it.
++        Any transport exception without a definite QQ rejection is ambiguous.
++        """
++        receipt = {"status": "failed", "message_ids": [], "segments": []}
++        try:
++            await self._send_by_session_common(session, message_chain, receipt, on_receipt)
++        except Exception as exc:
++            # SDK ServerError carries an explicit API error code. Timeouts, connection
++            # resets and exceptions in post-send hooks must never trigger fallback replay.
++            code = getattr(exc, "code", None)
++            explicit_sdk_rejection = type(exc).__module__ == "botpy.errors"
++            outcome = "failed" if code is not None or explicit_sdk_rejection else "unknown"
++            receipt["status"] = outcome
++            receipt["reason"] = type(exc).__name__
++            receipt["segments"].append({"status": outcome})
++        if receipt["message_ids"]:
++            receipt["partial"] = receipt["status"] != "confirmed"
++            receipt["status"] = "confirmed"
++        return receipt
++
+     async def _send_by_session_common(
+         self,
+         session: MessageSesion,
+         message_chain: MessageChain,
++        receipt: dict | None = None,
++        on_receipt=None,
+     ) -> None:
+         """Send a message after resolving the QQ Official delivery session.
+ 
+@@ -358,7 +383,9 @@
+         )
+         if len(message_chains) > 1:
+             for split_message_chain in message_chains:
+-                await self._send_by_session_common(session, split_message_chain)
++                await self._send_by_session_common(session, split_message_chain, receipt, on_receipt)
++                if receipt is not None and receipt.get('status') != 'confirmed':
++                    break
+             return
+ 
+         (
+@@ -560,6 +587,13 @@
+         sent_message_id = self._extract_message_id(ret)
+         if sent_message_id:
+             self.remember_session_message_id(session.session_id, sent_message_id)
++        if receipt is not None:
++            receipt['status'] = 'confirmed' if sent_message_id else 'unknown'
++            if sent_message_id:
++                receipt['message_ids'].append(sent_message_id)
++            receipt['segments'].append({'status': receipt['status'], 'message_id': sent_message_id})
++            if on_receipt is not None:
++                await on_receipt(dict(receipt, message_ids=list(receipt['message_ids'])))
+         await Platform.send_by_session(self, session, message_chain)
+ 
+     def remember_session_message_id(self, session_id: str, message_id: str) -> None:
